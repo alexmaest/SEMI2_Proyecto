@@ -1,8 +1,22 @@
-from database import connection
+from database import execute_queries, execute_country, execute_recover, inserted, failed
+from itertools import batched
 from io import StringIO
 import pandas as pd
 import requests
-import pymysql
+import sys
+
+towns = []
+departments = []
+deaths = []
+
+def arguments():
+    try:
+        if len(sys.argv) < 2:
+            print("Information: Please type the batch size as argument")
+            sys.exit(1)
+        return int(sys.argv[1])
+    except Exception as e:
+        print(f'Error: Failed to set batch size: {str(e)}')
 
 def load_towns(file):
     df = None
@@ -52,22 +66,24 @@ def clean_towns(df):
         df_processed = df_processed.drop(['codigo_departamento', 'codigo_municipio'], axis=1)
         print(df_processed)
 
-        # Only 2021 data
-        df_processed = df_processed.filter(regex=r'^(.*2021.*)$|^(departamento|municipio|poblacion)$', axis=1)
+        # Only 2020 data
+        df_processed = df_processed.filter(regex=r'^(.*2020.*)$|^(departamento|municipio|poblacion)$', axis=1)
         print(df_processed)
 
         # Replace null values and write invalid values to non determining columns
         modify = [col for col in df_processed.columns if col not in ['departamento', 'municipio']]
         for col in modify:
             df_processed[col] = pd.to_numeric(df_processed[col], errors='coerce').fillna(0).astype('Int64')
+            df_processed[col] = df_processed[col].apply(lambda x: max(x, 0))
         print(df_processed)
 
         # Delete rows with null values to determining columns
         df_processed = df_processed.dropna(subset=['departamento', 'municipio'])
         print(df_processed)
 
-        # Delete rows with incorrect type values to determining columns
-        df_processed = df_processed[~df_processed['departamento'].astype(str).str.isnumeric() & ~df_processed['municipio'].astype(str).str.isnumeric()]
+        # Clear to only right values on determining columns
+        credibilidad_mask = df_processed[['departamento','municipio']].map(lambda x: any(char.isdigit() for char in str(x)))
+        df_processed = df_processed[~credibilidad_mask.any(axis=1)]
         print(df_processed)
 
         print('\n')
@@ -97,6 +113,7 @@ def clean_countries(df, country):
         modify = [col for col in df_processed.columns if col not in ['date_reported', 'country']]
         for col in modify:
             df_processed[col] = pd.to_numeric(df_processed[col], errors='coerce').fillna(0).astype('Int64')
+            df_processed[col] = df_processed[col].apply(lambda x: max(x, 0))
         print(df_processed)
 
         # Replace null values and write invalid values to determining columns
@@ -110,8 +127,8 @@ def clean_countries(df, country):
         df_processed = df_processed.dropna(subset=['date_reported'])
         print(df_processed)
 
-        # Only 2021 data
-        df_processed = df_processed[df_processed['date_reported'].dt.year == 2021]
+        # Only 2020 data
+        df_processed = df_processed[df_processed['date_reported'].dt.year == 2020]
         print(df_processed)
 
         print('\n')
@@ -146,130 +163,89 @@ def transform_data(towns, countries):
         
     return df_final
 
-def insert_data(data):
-    try:
-        with connection.cursor() as cursor:
-            # Unique country insertion
-            query_country = "INSERT INTO country (Name) VALUES ('Guatemala')"
-            cursor.execute(query_country)
+def create_blocks(data, batch_size):
+    blocks = list(batched(data, batch_size))
+    final_blocks = []
+    execute_country()
+    print('\n')
+    print('Information: Creating',len(blocks),'blocks...')
+    print('\n')
+    for block in blocks:
+        queries = {}
+        queries.update({'departments': create_departments_query(block)})
+        queries.update({'towns': create_towns_query(block)})
+        queries.update({'deathsource1': create_deathsource1_query(block)})
+        queries.update({'deathsource2': create_deathsource2_query(block)})
+        final_blocks.append(queries)
 
-            # Obtain Guatemalan id
-            query_country_id = "SELECT Id FROM country WHERE Name = 'Guatemala'"
-            cursor.execute(query_country_id)
-            result = cursor.fetchone()
+    return final_blocks
 
-            if result:
-                country_id = result['Id']
-            else:
-                print("No se encontró el país 'Guatemala' en la tabla country")
-                return
+def create_departments_query(data):
+    departments_local = []
+    query = 'INSERT INTO department (Name, CountryId) VALUES\n'
+    for i, row in enumerate(data):
+        if any(department['Name'] == row.departamento for department in departments): continue
+        
+        departments.append({'Name': row.departamento})
+        departments_local.append({'Name': row.departamento})
+        query += f'(\'{row.departamento}\', (SELECT Id FROM country WHERE Name = \'Guatemala\')),\n'
+    if len(departments_local) == 0: return ''
+    else: return query[:-2] + ';\n'
 
-            # Insertion of Department, Town, DeathSource1 y DeathSource2 in blocks
-            block_size = 50
-            data_rows = []
-            inserted_blocks = 0
-            failed_blocks = 0
-            print('\n')
-            print('Information: Inserting blocks...')
-            print('\n')
-            for index, row in data.iterrows():
-                try:
-                    # Check if department already exists
-                    query_check_department = f"SELECT Id FROM department WHERE Name = '{row['departamento']}' AND CountryId = {country_id}"
-                    cursor.execute(query_check_department)
-                    result_department = cursor.fetchone()
+def create_towns_query(data):
+    towns_local = []
+    query = 'INSERT INTO town (Name, Poblation, DepartmentId) VALUES\n'
+    for i, row in enumerate(data):
+        if any(town['Department'] == row.departamento and town['Town'] == row.municipio for town in towns): continue
 
-                    if result_department:
-                        department_id = result_department['Id']
-                    else:
-                        query_department = f"INSERT INTO department (Name, CountryId) VALUES ('{row['departamento']}', {country_id}) ON DUPLICATE KEY UPDATE Id=LAST_INSERT_ID(Id)"
-                        cursor.execute(query_department)
+        towns.append({'Department': row.departamento, 'Town': row.municipio})
+        towns_local.append({'Department': row.departamento, 'Town': row.municipio})
+        query += f'(\'{row.municipio}\', {row.poblacion}, (SELECT Id FROM department WHERE Name = \'{row.departamento}\')),\n'
+    if len(towns_local) == 0: return ''
+    else: return query[:-2] + ';\n'
 
-                        query_department_id = "SELECT LAST_INSERT_ID()"
-                        cursor.execute(query_department_id)
-                        result_department_id = cursor.fetchone()
+def create_deathsource1_query(data):
+    query = 'INSERT INTO deathsource1 (Date, Number, TownId) VALUES\n'
+    for i, row in enumerate(data):
+        query += f'(\'{row.Fecha}\', {row.MuertesFuente1}, (SELECT Id FROM town WHERE Name = \'{row.municipio}\' AND DepartmentId = (SELECT Id FROM department WHERE Name = \'{row.departamento}\'))),\n'
 
-                        if result_department_id:
-                            department_id = result_department_id['LAST_INSERT_ID()']
-                        else:
-                            print('Error: Not inserted value',result_department_id)
-                            failed_blocks += 1
-                            connection.rollback()
-                            data_rows = []
-                            continue
+    return query[:-2] + ';\n'
 
-                    # Check if town already exists
-                    query_check_town = f"SELECT Id FROM town WHERE Name = '{row['municipio']}' AND DepartmentId = {department_id}"
-                    cursor.execute(query_check_town)
-                    result_town = cursor.fetchone()
+def create_deathsource2_query(data):
+    deaths_local = []
+    query = 'INSERT INTO deathsource2 (Date, Number, Acumulative, CountryId) VALUES\n'
+    for i, row in enumerate(data):
+        if any(death['date_reported'] == row.date_reported for death in deaths): continue
 
-                    if result_town:
-                        town_id = result_town['Id']
-                    else:
-                        query_town = f"INSERT INTO town (Name, Poblation, DepartmentId) VALUES ('{row['municipio']}', {row['poblacion']}, {department_id}) ON DUPLICATE KEY UPDATE Id=LAST_INSERT_ID(Id)"
-                        cursor.execute(query_town)
+        deaths.append({'date_reported': row.date_reported})
+        deaths_local.append({'date_reported': row.date_reported})
+        query += f'(\'{row.date_reported}\', {row.MuertesFuente2}, {row.MuertesAcumulativas}, (SELECT Id FROM country WHERE Name = \'Guatemala\')),\n'
+    if len(deaths_local) == 0: return ''
+    else: return query[:-2] + ';\n'
 
-                        query_town_id = "SELECT LAST_INSERT_ID()"
-                        cursor.execute(query_town_id)
-                        result_town_id = cursor.fetchone()
+def insert_data(blocks):
+    execute_queries(blocks)
+    execute_recover()
 
-                        if result_town_id:
-                            town_id = result_town_id['LAST_INSERT_ID()']
-                        else:
-                            print('Error: Not inserted value',result_town_id)
-                            failed_blocks += 1
-                            connection.rollback()
-                            data_rows = []
-                            continue
+# Arguments
+batch_size = arguments()
 
-                    query_deathsource1 = f"INSERT INTO DeathSource1 (Date, Number, TownId) VALUES ('{row['Fecha']}', {row['MuertesFuente1']}, {town_id})"
-                    cursor.execute(query_deathsource1)
+if (batch_size):
+    # Sources
+    source_towns = './data/municipio.csv'
+    source_countries = 'https://seminario2.blob.core.windows.net/fase1/global.csv?sp=r&st=2023-12-06T03:45:26Z&se=2024-01-04T11:45:26Z&sv=2022-11-02&sr=b&sig=xdx7LdUOekGyBvGL%2FNE55ZZj9SBvCC%2FWegxtpSsKjJg%3D'
 
-                    query_check_deathsource2 = f"SELECT Id FROM DeathSource2 WHERE Date = '{row['date_reported']}' AND CountryId = {country_id}"
-                    cursor.execute(query_check_deathsource2)
-                    result_deathsource2 = cursor.fetchone()
+    # Load data
+    towns_df = load_towns(source_towns)
+    countries_df = load_countries(source_countries)
 
-                    if not result_deathsource2:
-                        query_deathsource2 = f"INSERT INTO DeathSource2 (Date, Number, Acumulative, CountryId) VALUES ('{row['date_reported']}', {row['MuertesFuente2']}, {row['MuertesAcumulativas']}, {country_id})"
-                        cursor.execute(query_deathsource2)
+    # Clean data
+    towns_tr = clean_towns(towns_df)
+    countries_tr = clean_countries(countries_df, 'Guatemala')
 
-                    # Add row to actual block
-                    data_rows.append(row)
+    # Transform data
+    all_data = transform_data(towns_tr, countries_tr)
 
-                    # Block insertion and reset
-                    if len(data_rows) == block_size:
-                        connection.commit()
-                        inserted_blocks += 1
-                        data_rows = []
-                except Exception as e:
-                    print(f'Error: Not inserted value by the following error: {str(e)}')
-                    connection.rollback()
-
-            # Final commit
-            connection.commit()
-            print(f"\nBloques insertados: {inserted_blocks}", f"Bloques con errores: {failed_blocks}")
-
-    except pymysql.Error as err:
-        print(f"Error: {err}")
-        connection.rollback()
-
-    finally:
-        connection.close()
-
-# Sources
-source_towns = './data/municipio.csv'
-source_countries = 'https://seminario2.blob.core.windows.net/fase1/global.csv?sp=r&st=2023-12-06T03:45:26Z&se=2024-01-04T11:45:26Z&sv=2022-11-02&sr=b&sig=xdx7LdUOekGyBvGL%2FNE55ZZj9SBvCC%2FWegxtpSsKjJg%3D'
-
-# Load data
-towns_df = load_towns(source_towns)
-countries_df = load_countries(source_countries)
-
-# Clean data
-towns_tr = clean_towns(towns_df)
-countries_tr = clean_countries(countries_df, 'Guatemala')
-
-# Transform data
-all_data = transform_data(towns_tr, countries_tr)
-
-# Insert data
-insert_data(all_data)
+    # Insert data
+    blocks = create_blocks(list(all_data.itertuples()), batch_size)
+    insert_data(blocks)
